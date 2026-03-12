@@ -147,7 +147,7 @@ class SnowflakeCardSpendAgent:
             current, prev = vals[-1], vals[-2]
             abs_diff = abs(current - prev)
             
-            if abs_diff <= 3:
+            if abs_diff <= 1:
                 return ('Unchanged', '#2196f3')  # blue for unchanged
             
             abs_trend = abs(current) - abs(prev)
