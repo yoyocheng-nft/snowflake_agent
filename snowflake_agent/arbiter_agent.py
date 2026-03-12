@@ -41,19 +41,72 @@ class SnowflakeCardSpendAgent:
         df = pd.DataFrame([r.asDict() for r in rows])
         if not df.empty:
             df['DATE'] = pd.to_datetime(df['DATE'])
-        print(f"  rows: {len(df):,}, columns: {list(df.columns)}")
+            latest_date = df['DATE'].max()
+            print(f"  rows: {len(df):,}, columns: {list(df.columns)}")
+            print(f"  latest DATE: {latest_date.date()}")
+        else:
+            print(f"  rows: {len(df):,}, columns: {list(df.columns)}")
         return df
 
-    def _weekly_yoy(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Aggregate the YOY percent‑change column to weekly frequency."""
-        # week-ending date (Monday) to bucket the data
-        df['WEEK_END'] = df['DATE'] - pd.to_timedelta(df['DATE'].dt.weekday, unit='d')
-        weekly = (
-            df.groupby(['WEEK_END', 'TICKER', 'EXCHANGE'])['YOY_PCT_CHANGE']
-              .mean()
-              .reset_index()
-        )
-        return weekly
+    def _get_daily_yoy(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Return daily YOY data without aggregation."""
+        # Just select the columns we need, sorted by date
+        daily = df[['DATE', 'TICKER', 'EXCHANGE', 'YOY_PCT_CHANGE']].sort_values('DATE')
+        return daily
+
+    def _calculate_summary_metrics(self, pivot: pd.DataFrame, dates: list) -> dict:
+        """Calculate summary metrics for the 4 summary cards."""
+        summary = {}
+        
+        if len(dates) < 2:
+            # Not enough data for comparison
+            return {
+                'highest_increase': [],
+                'highest_decline': [],
+                'neg_to_pos': [],
+                'pos_to_neg': []
+            }
+        
+        latest_col = dates[-1]
+        prev_col = dates[-2]
+        
+        # Create a working copy with only numeric columns
+        work_pivot = pivot[[latest_col, prev_col]].copy()
+        work_pivot['latest'] = pd.to_numeric(pivot[latest_col], errors='coerce')
+        work_pivot['previous'] = pd.to_numeric(pivot[prev_col], errors='coerce')
+        
+        # 1. Top 10 with highest YoY increase (latest - previous)
+        work_pivot['change'] = work_pivot['latest'] - work_pivot['previous']
+        highest_increase = work_pivot[work_pivot['change'].notna()].nlargest(10, 'change')
+        summary['highest_increase'] = [
+            (idx[0], round(row['change'], 2), round(row['latest'], 2)) 
+            for idx, row in highest_increase.iterrows()
+        ]
+        
+        # 2. Top 10 with highest YoY decline
+        highest_decline = work_pivot[work_pivot['change'].notna()].nsmallest(10, 'change')
+        summary['highest_decline'] = [
+            (idx[0], round(row['change'], 2), round(row['latest'], 2)) 
+            for idx, row in highest_decline.iterrows()
+        ]
+        
+        # 3. Tickers that flipped from negative to positive
+        neg_to_pos = work_pivot[(work_pivot['previous'] < 0) & (work_pivot['latest'] > 0)]
+        neg_to_pos = neg_to_pos.sort_values('change', ascending=False)
+        summary['neg_to_pos'] = [
+            (idx[0], round(row['previous'], 2), round(row['latest'], 2), round(row['change'], 2))
+            for idx, row in neg_to_pos.iterrows()
+        ]
+        
+        # 4. Tickers that flipped from positive to negative
+        pos_to_neg = work_pivot[(work_pivot['previous'] > 0) & (work_pivot['latest'] < 0)]
+        pos_to_neg = pos_to_neg.sort_values('change')  # Most negative change first
+        summary['pos_to_neg'] = [
+            (idx[0], round(row['previous'], 2), round(row['latest'], 2), round(row['change'], 2))
+            for idx, row in pos_to_neg.iterrows()
+        ]
+        
+        return summary
 
     def generate_dashboard(self, output_path: str = "yoY_dashboard.html", exclude_tickers: list[str] | None = None) -> str:
         """Fetch, transform and write an HTML table.
@@ -66,17 +119,19 @@ class SnowflakeCardSpendAgent:
         # drop unwanted tickers early
         if exclude_tickers:
             df = df[~df['TICKER'].isin(exclude_tickers)]
-        weekly = self._weekly_yoy(df)
+        daily = self._get_daily_yoy(df)
 
-        # determine which weekly dates to show (past 3 months on 7‑day spacing)
-        latest = weekly['WEEK_END'].max()
-        dates = [latest - pd.Timedelta(days=7 * i) for i in range(12, -1, -1)]
-        dates = [d for d in dates if d in weekly['WEEK_END'].unique()]
+        # determine which dates to show (latest date, then -7 days, -14 days, etc. for past 3 months)
+        latest = daily['DATE'].max()
+        dates = [latest - pd.Timedelta(days=7 * i) for i in range(13)]  # 0 to 12 weeks back
+        # Only keep dates that exist in the data
+        dates = [d for d in dates if d in daily['DATE'].unique()]
+        dates = sorted(dates)  # Sort in ascending order for display
 
-        # pivot the table using the already‑computed YOY percentage
-        pivot = weekly.pivot_table(
+        # pivot the table using the YOY_PCT_CHANGE values directly
+        pivot = daily.pivot_table(
             index=['TICKER', 'EXCHANGE'],
-            columns='WEEK_END',
+            columns='DATE',
             values='YOY_PCT_CHANGE'
         )
         pivot = pivot.reindex(columns=dates)
@@ -109,6 +164,9 @@ class SnowflakeCardSpendAgent:
 
         trends = pivot.apply(label_trend, axis=1)
         pivot['Trend'], pivot['TrendColor'] = zip(*trends)
+
+        # Calculate summary metrics for cards
+        summary_data = self._calculate_summary_metrics(pivot, dates)
 
         # prepare chart data for each ticker
         chart_data = {}
@@ -172,6 +230,54 @@ class SnowflakeCardSpendAgent:
                 color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer;
             }
             .close:hover { color: #fff; }
+            .summary-cards {
+                display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+                gap: 20px; margin-bottom: 40px;
+            }
+            .card {
+                background: #0d1b2a; border: 1px solid #2a3d52; border-radius: 8px;
+                padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                display: flex; flex-direction: column;
+            }
+            .card-title {
+                color: #4fc3f7; font-weight: 700; font-size: 0.95em;
+                margin-bottom: 15px; text-transform: uppercase; letter-spacing: 0.5px;
+                flex-shrink: 0;
+            }
+            .card-items {
+                max-height: 360px; overflow-y: auto; overflow-x: hidden;
+                padding-right: 8px;
+            }
+            .card-items::-webkit-scrollbar {
+                width: 6px;
+            }
+            .card-items::-webkit-scrollbar-track {
+                background: #0d1b2a;
+                border-radius: 3px;
+            }
+            .card-items::-webkit-scrollbar-thumb {
+                background: #2a3d52;
+                border-radius: 3px;
+            }
+            .card-items::-webkit-scrollbar-thumb:hover {
+                background: #3a4d62;
+            }
+            .card-item {
+                display: flex; justify-content: space-between; align-items: center;
+                padding: 8px 0; border-bottom: 1px solid #1f2c3d; font-size: 0.87em;
+            }
+            .card-item:last-child { border-bottom: none; }
+            .card-ticker {
+                color: #4fc3f7; font-weight: 700; min-width: 50px;
+            }
+            .card-value {
+                text-align: right; font-family: 'Courier New', monospace;
+            }
+            .card-value.positive { color: #4caf50; }
+            .card-value.negative { color: #e74c3c; }
+            .card-empty {
+                color: #666; font-style: italic; padding: 10px 0;
+            }
         """
         html = [
             '<html><head><meta charset="utf-8">',
@@ -180,9 +286,55 @@ class SnowflakeCardSpendAgent:
             '<style>', css, '</style></head><body>',
             '<div class="container">',
             '<h1>Arbiter Data YoY % Inflection Dashboard</h1>',
-            f'<div class="subheader">Latest date: {weekly["WEEK_END"].max().date()}</div>',
-            '<table><thead><tr><th>TICKER</th><th>EXCHANGE</th>'
+            f'<div class="subheader">Latest date: {latest.date()}</div>',
         ]
+        
+        # Add summary cards
+        html.append('<div class="summary-cards">')
+        
+        # Card 1: Highest Increase
+        html.append('<div class="card"><div class="card-title">Top 10: Highest YoY Increase</div><div class="card-items">')
+        if summary_data['highest_increase']:
+            for ticker, change, latest in summary_data['highest_increase']:
+                change_class = 'positive' if change >= 0 else 'negative'
+                html.append(f'<div class="card-item"><span class="card-ticker">{ticker}</span><span class="card-value {change_class}">+{change:.2f}% (→ <strong>{latest:.2f}%</strong>)</span></div>')
+        else:
+            html.append('<div class="card-empty">No data available</div>')
+        html.append('</div></div>')
+        
+        # Card 2: Highest Decline
+        html.append('<div class="card"><div class="card-title">Top 10: Highest YoY Decline</div><div class="card-items">')
+        if summary_data['highest_decline']:
+            for ticker, change, latest in summary_data['highest_decline']:
+                change_class = 'negative' if change < 0 else 'positive'
+                html.append(f'<div class="card-item"><span class="card-ticker">{ticker}</span><span class="card-value {change_class}">{change:.2f}% (→ <strong>{latest:.2f}%</strong>)</span></div>')
+        else:
+            html.append('<div class="card-empty">No data available</div>')
+        html.append('</div></div>')
+        
+        # Card 3: Negative to Positive Flip (filter out changes < 1%)
+        html.append('<div class="card"><div class="card-title">Inflection: -ve to +ve YoY</div><div class="card-items">')
+        filtered_neg_to_pos = [item for item in summary_data['neg_to_pos'] if abs(item[3]) >= 1.0]
+        if filtered_neg_to_pos:
+            for ticker, prev, latest, change in filtered_neg_to_pos:
+                html.append(f'<div class="card-item"><span class="card-ticker">{ticker}</span><span class="card-value positive">{prev:.2f}% → {latest:.2f}% (+{change:.2f}%)</span></div>')
+        else:
+            html.append('<div class="card-empty">No inflections</div>')
+        html.append('</div></div>')
+        
+        # Card 4: Positive to Negative Flip (filter out changes < 1%)
+        html.append('<div class="card"><div class="card-title">Inflection: +ve to -ve YoY</div><div class="card-items">')
+        filtered_pos_to_neg = [item for item in summary_data['pos_to_neg'] if abs(item[3]) >= 1.0]
+        if filtered_pos_to_neg:
+            for ticker, prev, latest, change in filtered_pos_to_neg:
+                html.append(f'<div class="card-item"><span class="card-ticker">{ticker}</span><span class="card-value negative">{prev:.2f}% → {latest:.2f}% ({change:.2f}%)</span></div>')
+        else:
+            html.append('<div class="card-empty">No inflections</div>')
+        html.append('</div></div>')
+        
+        html.append('</div>')  # Close summary-cards div
+        
+        html.append('<table><thead><tr><th>TICKER</th><th>EXCHANGE</th>')
         for d in dates:
             html.append(f'<th>{d.date()}</th>')
         html.append('<th>Trend</th></tr></thead><tbody>')
