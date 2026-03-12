@@ -4,13 +4,10 @@ Reads card spend data, performs transformations (14-day MA, YoY),
 and generates an HTML dashboard
 """
 
-import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 import pandas as pd
-from snowflake.snowpark import Session
-from cryptography.hazmat.primitives import serialization
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -46,6 +43,24 @@ class SnowflakeCardSpendAgent:
             print(f"  latest DATE: {latest_date.date()}")
         else:
             print(f"  rows: {len(df):,}, columns: {list(df.columns)}")
+        return df
+
+    def fetch_monitor_data(self, tickers: list) -> pd.DataFrame:
+        """Fetch data for monitor tickers from Jan 1 of (current_year - 1) to now."""
+        current_year = datetime.now().year
+        start_date = f"{current_year - 1}-01-01"
+        tickers_str = ",".join([f"'{t}'" for t in tickers])
+        print(f"\n📊 querying {self.source_table} for monitor tickers since {start_date}")
+        sql = (
+            f"SELECT DATE, TICKER, MOVING_AVG_14_DAY FROM {self.source_table} "
+            f"WHERE DATE >= '{start_date}' AND TICKER IN ({tickers_str})"
+        )
+        snowpark_df = self.session.sql(sql)
+        rows = snowpark_df.collect()
+        df = pd.DataFrame([r.asDict() for r in rows])
+        if not df.empty:
+            df['DATE'] = pd.to_datetime(df['DATE'])
+            print(f"  monitor data rows: {len(df):,}")
         return df
 
     def _get_daily_yoy(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -108,12 +123,13 @@ class SnowflakeCardSpendAgent:
         
         return summary
 
-    def generate_dashboard(self, output_path: str = "yoY_dashboard.html", exclude_tickers: list[str] | None = None) -> str:
+    def generate_dashboard(self, output_path: str = "yoY_dashboard.html", exclude_tickers: list[str] | None = None, monitor_tickers: list[str] | None = None) -> str:
         """Fetch, transform and write an HTML table.
 
         Args:
             output_path: file to write
             exclude_tickers: optional list of TICKER values to omit from display
+            monitor_tickers: optional list of ticker symbols to include in the Ticker Monitor tab
         """
         df = self.fetch_data()
         # drop unwanted tickers early
@@ -168,11 +184,40 @@ class SnowflakeCardSpendAgent:
         # Calculate summary metrics for cards
         summary_data = self._calculate_summary_metrics(pivot, dates)
 
-        # prepare chart data for each ticker
+        # prepare chart data for each ticker+exchange combo (for popup charts)
+        # Use ticker_exchange as key to distinguish same ticker on different exchanges
         chart_data = {}
-        for ticker in df['TICKER'].unique():
-            ticker_df = df[df['TICKER'] == ticker][['DATE', 'MOVING_AVG_14_DAY']].sort_values('DATE')
-            chart_data[ticker] = [{'x': d.isoformat(), 'y': float(v) if pd.notna(v) else None} for d, v in zip(ticker_df['DATE'], ticker_df['MOVING_AVG_14_DAY'])]
+        for (ticker, exch) in df[['TICKER', 'EXCHANGE']].drop_duplicates().values:
+            ticker_df = df[(df['TICKER'] == ticker) & (df['EXCHANGE'] == exch)][['DATE', 'MOVING_AVG_14_DAY']].sort_values('DATE')
+            # Filter out NaN values and format date as YYYY-MM-DD for Chart.js
+            ticker_df = ticker_df.dropna(subset=['MOVING_AVG_14_DAY'])
+            # Key format: "TICKER_EXCHANGE" (e.g., "AAPL_NASDAQ")
+            chart_key = f"{ticker}_{exch}"
+            chart_data[chart_key] = [{'x': d.strftime('%Y-%m-%d'), 'y': float(v)} for d, v in zip(ticker_df['DATE'], ticker_df['MOVING_AVG_14_DAY'])]
+
+        # prepare monitor chart data with day-of-year format for multi-year comparison
+        if monitor_tickers is None:
+            monitor_tickers = ['TGT', 'PINS', 'MSFT', 'META', 'AMZN', 'HD']
+        monitor_df = self.fetch_monitor_data(monitor_tickers)
+        monitor_chart_data = {}
+        current_year = datetime.now().year
+        
+        for ticker in monitor_tickers:
+            ticker_df = monitor_df[monitor_df['TICKER'] == ticker].copy()
+            ticker_df = ticker_df.dropna(subset=['MOVING_AVG_14_DAY'])
+            if ticker_df.empty:
+                continue
+            
+            ticker_df['YEAR'] = ticker_df['DATE'].dt.year
+            ticker_df['DAY_OF_YEAR'] = ticker_df['DATE'].dt.dayofyear
+            
+            monitor_chart_data[ticker] = {}
+            for year in [current_year - 1, current_year]:  # 2025, 2026
+                year_data = ticker_df[ticker_df['YEAR'] == year].sort_values('DAY_OF_YEAR')
+                monitor_chart_data[ticker][str(year)] = [
+                    {'x': int(doy), 'y': float(v)} 
+                    for doy, v in zip(year_data['DAY_OF_YEAR'], year_data['MOVING_AVG_14_DAY'])
+                ]
 
         # build html with fintech dark-mode styling
         css = """
@@ -272,11 +317,47 @@ class SnowflakeCardSpendAgent:
             }
             .card-value {
                 text-align: right; font-family: 'Courier New', monospace;
+                padding: 4px 8px; border-radius: 4px;
             }
-            .card-value.positive { color: #4caf50; }
-            .card-value.negative { color: #e74c3c; }
+            .card-value.positive { color: #4caf50; background: rgba(76, 175, 80, 0.2); }
+            .card-value.negative { color: #e74c3c; background: rgba(231, 76, 60, 0.2); }
             .card-empty {
                 color: #666; font-style: italic; padding: 10px 0;
+            }
+            .tabs {
+                display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 2px solid #2a3d52;
+            }
+            .tab-button {
+                padding: 12px 24px; background: transparent; border: none;
+                color: #90a4ae; font-weight: 700; font-size: 0.95em;
+                cursor: pointer; text-transform: uppercase; letter-spacing: 0.5px;
+                border-bottom: 3px solid transparent; transition: all 0.3s;
+            }
+            .tab-button.active {
+                color: #4fc3f7; border-bottom-color: #4fc3f7;
+            }
+            .tab-button:hover {
+                color: #b0bec5;
+            }
+            .tab-content {
+                /* display controlled by hidden class */
+            }
+            .hidden {
+                display: none !important;
+            }
+            .monitor-grid {
+                display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+                gap: 20px; margin-top: 20px;
+            }
+            .chart-container {
+                background: #0d1b2a; border: 1px solid #2a3d52; border-radius: 8px;
+                padding: 15px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            }
+            .chart-title {
+                color: #4fc3f7; font-weight: 700; margin-bottom: 10px; font-size: 0.95em;
+            }
+            .chart-canvas-wrapper {
+                position: relative; height: 250px;
             }
         """
         html = [
@@ -287,6 +368,11 @@ class SnowflakeCardSpendAgent:
             '<div class="container">',
             '<h1>Arbiter Data YoY % Inflection Dashboard</h1>',
             f'<div class="subheader">Latest date: {latest.date()}</div>',
+            '<div class="tabs">',
+            '<button id="tab-summary" class="tab-button" onclick="switchTab(\'summary\')">Summary</button>',
+            '<button id="tab-monitor" class="tab-button active" onclick="switchTab(\'monitor\')">Ticker Monitor</button>',
+            '</div>',
+            '<div id="pane-summary" class="tab-content hidden">',
         ]
         
         # Add summary cards
@@ -341,7 +427,7 @@ class SnowflakeCardSpendAgent:
 
         for idx, row in pivot.iterrows():
             ticker, exch = idx
-            html.append(f'<tr><td class="ticker-cell" data-ticker="{ticker}">{ticker}</td><td>{exch}</td>')
+            html.append(f'<tr><td class="ticker-cell" data-ticker="{ticker}" data-exchange="{exch}">{ticker}</td><td>{exch}</td>')
             for d in dates:
                 val = row.get(d, '')
                 if pd.notna(val):
@@ -352,44 +438,232 @@ class SnowflakeCardSpendAgent:
             html.append(f'<td style="color:{color}" class="trend-cell">{tag}</td></tr>')
 
         html.append('</tbody></table>')
+        html.append('</div>')  # Close summary tab-content
+        
+        # Add Ticker Monitor tab with charts for specific tickers
+        html.append('<div id="pane-monitor" class="tab-content">')
+        html.append('<div class="monitor-grid">')
+        for ticker in monitor_tickers:
+            if ticker in monitor_chart_data and monitor_chart_data[ticker]:
+                html.append(f'<div class="chart-container">')
+                html.append(f'<div class="chart-title">{ticker} - 14-Day Moving Average (YoY Comparison)</div>')
+                html.append(f'<div class="chart-canvas-wrapper"><canvas id="chart-{ticker}"></canvas></div>')
+                html.append('</div>')
+            else:
+                html.append(f'<div class="chart-container">')
+                html.append(f'<div class="chart-title">{ticker} - No Data</div>')
+                html.append(f'<div style="color: #666; padding: 20px; text-align: center;">No data available for {ticker}</div>')
+                html.append('</div>')
+        html.append('</div>')
+        html.append('</div>')  # Close monitor tab-content
+        
         html.append('<div id="chartModal" class="modal"><div class="modal-content"><span class="close">&times;</span><canvas id="chartCanvas"></canvas></div></div>')
         html.append('<script>')
         html.append(f'const chartData = {json.dumps(chart_data)};')
+        html.append(f'const monitorChartData = {json.dumps(monitor_chart_data)};')
+        html.append(f'const monitorTickersList = {json.dumps(monitor_tickers)};')
+        html.append(f'const currentYear = {current_year};')
         html.append('''
         let chart = null;
-        document.querySelectorAll('.ticker-cell').forEach(cell => {
-            cell.addEventListener('click', function() {
-                const ticker = this.getAttribute('data-ticker');
-                showChart(ticker);
+        let monitorCharts = {};
+
+        // Tab switching function
+        function switchTab(tabId) {
+            // Hide all panes
+            document.getElementById('pane-summary').classList.add('hidden');
+            document.getElementById('pane-monitor').classList.add('hidden');
+
+            // Show selected pane
+            document.getElementById('pane-' + tabId).classList.remove('hidden');
+
+            // Update tab buttons
+            document.getElementById('tab-summary').classList.remove('active');
+            document.getElementById('tab-monitor').classList.remove('active');
+            document.getElementById('tab-' + tabId).classList.add('active');
+            
+            // Resize charts if switching to monitor tab
+            if (tabId === 'monitor') {
+                setTimeout(function() {
+                    for (var key in monitorCharts) {
+                        if (monitorCharts[key] && monitorCharts[key].resize) {
+                            monitorCharts[key].resize();
+                        }
+                    }
+                }, 100);
+            }
+        }
+        
+        // Initialize monitor charts with year-over-year comparison
+        function initMonitorCharts() {
+            var monitorTickers = monitorTickersList;
+            var prevYear = currentYear - 1;
+            
+            monitorTickers.forEach(function(ticker) {
+                if (monitorChartData[ticker]) {
+                    var ctx = document.getElementById('chart-' + ticker);
+                    if (ctx) {
+                        var datasets = [];
+                        
+                        // Previous year data (blue) - drawn first (background)
+                        var prevYearKey = String(prevYear);
+                        if (monitorChartData[ticker][prevYearKey] && monitorChartData[ticker][prevYearKey].length > 0) {
+                            datasets.push({
+                                label: prevYear.toString(),
+                                data: monitorChartData[ticker][prevYearKey],
+                                borderColor: '#4fc3f7',
+                                backgroundColor: 'rgba(79, 195, 247, 0.1)',
+                                fill: false,
+                                tension: 0.3,
+                                borderWidth: 2,
+                                pointRadius: 1,
+                                pointBackgroundColor: '#4fc3f7',
+                                order: 2
+                            });
+                        }
+                        
+                        // Current year data (yellow) - drawn last (foreground/on top)
+                        var currYearKey = String(currentYear);
+                        if (monitorChartData[ticker][currYearKey] && monitorChartData[ticker][currYearKey].length > 0) {
+                            datasets.push({
+                                label: currentYear.toString(),
+                                data: monitorChartData[ticker][currYearKey],
+                                borderColor: '#ffd740',
+                                backgroundColor: 'rgba(255, 215, 64, 0.1)',
+                                fill: false,
+                                tension: 0.3,
+                                borderWidth: 2,
+                                pointRadius: 1,
+                                pointBackgroundColor: '#ffd740',
+                                order: 1
+                            });
+                        }
+                        
+                        if (datasets.length > 0) {
+                            monitorCharts[ticker] = new Chart(ctx, {
+                                type: 'line',
+                                data: { datasets: datasets },
+                                options: {
+                                    responsive: true,
+                                    maintainAspectRatio: false,
+                                    plugins: {
+                                        legend: { 
+                                            labels: { color: '#c5cae9' },
+                                            position: 'top'
+                                        },
+                                        tooltip: {
+                                            callbacks: {
+                                                title: function(context) {
+                                                    var dayOfYear = context[0].parsed.x;
+                                                    var monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                                                    var d = new Date(2024, 0);
+                                                    d.setDate(dayOfYear);
+                                                    return monthNames[d.getMonth()] + ' ' + d.getDate();
+                                                }
+                                            }
+                                        }
+                                    },
+                                    scales: {
+                                        x: {
+                                            type: 'linear',
+                                            min: 1,
+                                            max: 366,
+                                            title: {
+                                                display: true,
+                                                text: 'Day of Year',
+                                                color: '#90a4ae'
+                                            },
+                                            grid: { color: 'rgba(42, 61, 82, 0.3)' },
+                                            ticks: { 
+                                                color: '#90a4ae',
+                                                callback: function(value) {
+                                                    // Convert day of year to month abbreviation
+                                                    var monthStarts = {1: 'Jan', 32: 'Feb', 60: 'Mar', 91: 'Apr', 121: 'May', 152: 'Jun', 182: 'Jul', 213: 'Aug', 244: 'Sep', 274: 'Oct', 305: 'Nov', 335: 'Dec'};
+                                                    return monthStarts[value] || '';
+                                                },
+                                                stepSize: 30
+                                            }
+                                        },
+                                        y: {
+                                            beginAtZero: false,
+                                            title: {
+                                                display: true,
+                                                text: '14-Day Moving Avg',
+                                                color: '#90a4ae'
+                                            },
+                                            grid: { color: 'rgba(42, 61, 82, 0.3)' },
+                                            ticks: { color: '#90a4ae' }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        }
+        
+        // Initialize on DOM ready
+        document.addEventListener('DOMContentLoaded', function() {
+            initMonitorCharts();
+            
+            // Setup ticker cell click handlers
+            document.querySelectorAll('.ticker-cell').forEach(function(cell) {
+                cell.addEventListener('click', function() {
+                    var ticker = this.getAttribute('data-ticker');
+                    var exchange = this.getAttribute('data-exchange');
+                    showChart(ticker, exchange);
+                });
+            });
+            
+            // Setup modal close handlers
+            var closeBtn = document.querySelector('.close');
+            if (closeBtn) {
+                closeBtn.addEventListener('click', closeModal);
+            }
+            window.addEventListener('click', function(event) {
+                var modal = document.getElementById('chartModal');
+                if (event.target === modal) {
+                    closeModal();
+                }
             });
         });
-        document.querySelector('.close').addEventListener('click', closeModal);
-        window.addEventListener('click', function(event) {
-            const modal = document.getElementById('chartModal');
-            if (event.target == modal) {
-                closeModal();
-            }
-        });
-        function showChart(ticker) {
-            const modal = document.getElementById('chartModal');
-            const ctx = document.getElementById('chartCanvas').getContext('2d');
+
+        function showChart(ticker, exchange) {
+            var modal = document.getElementById('chartModal');
+            var ctx = document.getElementById('chartCanvas').getContext('2d');
             if (chart) chart.destroy();
+            
+            // Build chart key using ticker and exchange
+            var chartKey = ticker + '_' + exchange;
+            
+            if (!chartData[chartKey] || chartData[chartKey].length === 0) {
+                console.error('No data found for ' + chartKey);
+                return;
+            }
+            
+            var processedData = chartData[chartKey].map(function(point) {
+                return { x: new Date(point.x), y: point.y };
+            });
+            
             chart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     datasets: [{
-                        label: `${ticker} Moving Avg 14-Day`,
-                        data: chartData[ticker],
+                        label: ticker + ' (' + exchange + ') Moving Avg 14-Day',
+                        data: processedData,
                         borderColor: '#4fc3f7',
                         backgroundColor: 'rgba(79, 195, 247, 0.1)',
-                        fill: true
+                        fill: true,
+                        borderWidth: 2,
+                        pointRadius: 2,
+                        pointBackgroundColor: '#4fc3f7'
                     }]
                 },
                 options: {
                     plugins: {
                         title: {
                             display: true,
-                            text: `${ticker} Moving Avg 14-Day Card Spend`
+                            text: ticker + ' (' + exchange + ') Moving Avg 14-Day Card Spend'
                         }
                     },
                     scales: {

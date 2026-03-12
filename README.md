@@ -2,21 +2,27 @@
 
 # Arbiter Data YoY % Inflection Dashboard
 
-A Python agent that reads pre-transformed card spend data from Snowflake, performs weekly YoY aggregations, and generates an interactive HTML dashboard with trend analysis and charts.
+A Python agent that reads pre-transformed card spend data from Snowflake and generates an interactive HTML dashboard with trend analysis, summary metrics, and year-over-year comparisons.
 
 ## Features
 
 ✨ **Data Reading**: Fetches pre-transformed card spend data from Snowflake tables  
-🔄 **Weekly Aggregation**: Aggregates daily YoY percentage changes to weekly frequency  
-📊 **Interactive Dashboard**: Creates beautiful HTML dashboards with:
+� **Interactive Dashboard**: Creates beautiful HTML dashboards with:
+  - Summary cards highlighting top gainers, decliners, and inflection points
   - Trend indicators (Accelerating/Decelerating/Unchanged)
   - Color-coded cells based on performance
   - Clickable tickers with Chart.js time-series charts
   - Dark fintech theme with modern styling
 
 🚀 **On-Demand Execution**: Run anytime with customizable parameters  
-🎯 **Ticker Filtering**: Exclude unwanted tickers from analysis  
-📈 **Visual Analytics**: Interactive charts showing 14-day moving averages over time
+🎯 **Ticker Management**: 
+  - Exclude unwanted tickers from main analysis
+  - Dedicated Ticker Monitor tab with year-over-year comparisons
+  
+📈 **Visual Analytics**: 
+  - Interactive charts showing 14-day moving averages over time
+  - Multi-year comparison views for selected tickers
+  - 12-week historical trend analysis
 
 ## Setup
 
@@ -77,7 +83,8 @@ agent = SnowflakeCardSpendAgent()
 # Generate dashboard with custom settings
 agent.generate_dashboard(
     output_path="my_dashboard.html",
-    exclude_tickers=['AAPL', 'GOOGL']  # Optional: exclude specific tickers
+    exclude_tickers=['AAPL', 'GOOGL'],  # Optional: exclude from main table
+    monitor_tickers=['TGT', 'MSFT', 'AMZN']  # Optional: tickers for Monitor tab
 )
 ```
 
@@ -91,13 +98,14 @@ agent = SnowflakeCardSpendAgent()
 # Fetch raw data (last 90 days by default)
 df = agent.fetch_data(days_back=90)
 
-# Generate weekly YoY aggregations
-weekly_data = agent._weekly_yoy(df)
+# Fetch monitor data for specific year range
+monitor_data = agent.fetch_monitor_data(tickers=['TGT', 'MSFT', 'AMZN'])
 
-# Create dashboard
+# Create dashboard with both exclusions and monitor tickers
 agent.generate_dashboard(
     output_path="custom_dashboard.html",
-    exclude_tickers=['TICKER1', 'TICKER2']
+    exclude_tickers=['TICKER1', 'TICKER2'],
+    monitor_tickers=['MSFT', 'AAPL', 'GOOG']
 )
 ```
 
@@ -111,49 +119,71 @@ agent.generate_dashboard(
    - Generates interactive HTML dashboards
 
 2. **Data Flow**
-   - `fetch_data()`: Retrieves pre-transformed data from Snowflake
-   - `_weekly_yoy()`: Aggregates daily data to weekly frequency
-   - `generate_dashboard()`: Creates HTML with tables and charts
+   - `fetch_data()`: Retrieves last 90 days of pre-transformed data from Snowflake
+   - `fetch_monitor_data()`: Retrieves data for specified tickers from Jan 1 of (current year - 1) to now
+   - `generate_dashboard()`: Creates HTML with summary metrics, interactive tables, and charts
 
 ### Data Processing Logic
 
-**Weekly YoY Aggregation**:
-- Groups data by week-ending date (Monday)
-- Calculates mean YoY % change for each ticker per week
-- Filters to most recent 12 weeks (3 months)
+**Summary Metrics Calculation**:
+- Top 10 tickers with highest YoY increase
+- Top 10 tickers with highest YoY decline
+- Tickers that flipped from negative to positive YoY
+- Tickers that flipped from positive to negative YoY
 
 **Trend Analysis**:
-- Compares current vs previous week YoY values
-- Classifies as: Accelerating, Decelerating, or Unchanged
+- Compares latest vs previous date YoY values
+- Classifies as: Accelerating, Decelerating, or Unchanged (±1% threshold)
 - Color codes: Green (positive), Red (negative), Blue (unchanged)
 
+**Ticker Monitor Tab**:
+- Year-over-year comparison charts for selected tickers
+- Shows current year vs previous year on same day-of-year axis
+- 14-day moving average visualization
+
 **Dashboard Features**:
-- **Interactive Charts**: Click ticker names to view 14-day MA time series
+- **Summary Cards**: Quick overview of key metrics and inflection points
+- **Interactive Table**: Click ticker names to view 14-day MA time series
+- **Monitor Tab**: Dedicated view for year-over-year comparisons
 - **Color Coding**: Visual indicators for performance trends
 - **Responsive Design**: Modern dark theme optimized for financial data
 - **Chart.js Integration**: Professional time-series visualization
 
 ## Dashboard Output
 
-The generated HTML dashboard includes:
+The generated HTML dashboard includes two main tabs:
 
-### Header Section
-- Dashboard title and latest data date
-- Clean, professional fintech styling
+### Summary Tab
+Contains key metrics and comprehensive data table.
 
-### Main Data Table
-- **Columns**: TICKER, EXCHANGE, Weekly Dates, Trend
+**Summary Cards**:
+- Top 10 tickers with highest YoY increase
+- Top 10 tickers with highest YoY decline
+- Tickers that flipped from negative to positive YoY
+- Tickers that flipped from positive to negative YoY
+
+**Main Data Table**:
+- **Columns**: TICKER, EXCHANGE, Date values (12 weeks back), Trend
 - **Rows**: Sorted by latest YoY % (descending)
 - **Color Coding**:
   - 🟢 Green: Positive YoY accelerating
   - 🔴 Red: Negative YoY accelerating
-  - 🔵 Blue: Unchanged (±3% threshold)
+  - 🔵 Blue: Unchanged (±1% threshold)
   - Light colors: Decelerating trends
 
-### Interactive Features
+**Interactive Features**:
 - **Clickable Tickers**: Opens modal with Chart.js line chart
 - **Time Series Charts**: Shows 14-day moving average over time
 - **Modal Interface**: Clean popup for detailed views
+
+### Ticker Monitor Tab
+Dedicated view for year-over-year comparison of selected tickers.
+
+**Features**:
+- Side-by-side line charts for current and previous year
+- Day-of-year alignment for accurate seasonal comparison
+- 14-day moving average visualization
+- Responsive grid layout
 
 ## Configuration
 
@@ -164,13 +194,25 @@ The generated HTML dashboard includes:
 df = agent.fetch_data(days_back=180)  # 6 months instead of 3
 ```
 
-### Modify Exclusions
+### Customize Tickers
 
-Edit `run_dashboard.py` or call programmatically:
+Edit `run_dashboard.py` to customize ticker lists:
 
 ```python
-exclude_list = ['AAPL', 'MSFT', 'TSLA']  # Add tickers to exclude
-agent.generate_dashboard(exclude_tickers=exclude_list)
+# Tickers to exclude from main summary table
+EXCLUDE_TICKERS = ['AAPL', 'MSFT', 'TSLA']
+
+# Tickers to monitor in the dedicated Ticker Monitor tab
+MONITOR_TICKERS = ['TGT', 'PINS', 'MSFT', 'META', 'AMZN', 'HD']
+```
+
+Or customize programmatically:
+
+```python
+agent.generate_dashboard(
+    exclude_tickers=['AAPL', 'TSLA'],
+    monitor_tickers=['MSFT', 'GOOGL', 'AMZN']
+)
 ```
 
 ### Change Output Location
@@ -183,15 +225,15 @@ agent.generate_dashboard(output_path="/path/to/custom/dashboard.html")
 
 ```
 snowflake_agent/
-├── arbiter_agent.py          # Main agent class
-├── run_dashboard.py          # Execution script with defaults
-├── snowpark_utils.py         # Snowflake connection utilities
-├── credentials_sf.json       # Connection parameters
-├── rsa_key.p8               # Private key for auth
-├── examples.py              # Usage examples
-├── snowpark_connection_test.py # Connection testing
-├── requirements.txt          # Python dependencies
-└── README.md                # This file
+├── arbiter_agent.py            # Main agent class
+├── run_dashboard.py            # Execution script with configuration
+├── snowpark_utils.py           # Snowflake connection utilities
+├── credentials_sf.json         # Connection parameters (not in repo)
+├── rsa_key.p8                  # Private key for auth (not in repo)
+├── snowpark_connection_test.py # Connection testing utility
+├── requirements.txt            # Python dependencies
+├── arbiter_dashboard.html      # Generated dashboard output
+└── README.md                   # This file
 ```
 
 ## Dependencies
